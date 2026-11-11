@@ -1,0 +1,40 @@
+# Git Ignore Rules
+# OS and Editor Artifacts
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Environment Variables & Secrets
+.env
+*.env.local
+*.pem
+*.key
+*.crt
+*.csr
+id_rsa
+id_rsa.pub
+known_hosts
+
+# Docker and Local Volumes
+docker/volumes/*
+!docker/volumes/.gitkeep
+
+# Terraform Local State & Provider Cache
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.backup
+terraform/.terraform.lock.hcl
+terraform/*.tfvars
+!terraform/terraform.tfvars.example
+
+# Puppet Dynamic Data & SSL
+puppet/ssl/
+puppet/environments/production/modules/*/pkg/
+
+# Logs & Temporary Files
+*.log
+/tmp/

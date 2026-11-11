@@ -1,0 +1,38 @@
+#!/bin/sh
+# Lightweight POSIX check_mem plugin for NRPE
+# Usage: check_mem -w <warn_percent> -c <crit_percent>
+
+WARN=80
+CRIT=90
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -w) WARN="$2"; shift 2 ;;
+    -c) CRIT="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+
+MEM_TOTAL=$(awk '/MemTotal:/ {print $2}' /proc/meminfo)
+MEM_AVAIL=$(awk '/MemAvailable:/ {print $2}' /proc/meminfo)
+
+if [ -z "$MEM_TOTAL" ] || [ -z "$MEM_AVAIL" ] || [ "$MEM_TOTAL" -le 0 ]; then
+  echo "UNKNOWN - Unable to read /proc/meminfo"
+  exit 3
+fi
+
+MEM_USED=$((MEM_TOTAL - MEM_AVAIL))
+USED_PCT=$(( (MEM_USED * 100) / MEM_TOTAL ))
+
+OUTPUT="Memory: ${USED_PCT}% used (${MEM_USED} kB / ${MEM_TOTAL} kB)"
+
+if [ "$USED_PCT" -ge "$CRIT" ]; then
+  echo "CRITICAL - ${OUTPUT}"
+  exit 2
+elif [ "$USED_PCT" -ge "$WARN" ]; then
+  echo "WARNING - ${OUTPUT}"
+  exit 1
+else
+  echo "OK - ${OUTPUT}"
+  exit 0
+fi

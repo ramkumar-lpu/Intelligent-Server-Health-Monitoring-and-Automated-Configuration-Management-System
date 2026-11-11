@@ -1,0 +1,24 @@
+# Docker Build Ignore
+.git/
+.github/
+.gitignore
+.dockerignore
+README.md
+
+# Sensitive files and credentials
+*.key
+*.pem
+*.crt
+*.pub
+*.env*
+id_rsa*
+
+# Terraform and Jenkins caches
+terraform/
+jenkins/
+extensions/
+scripts/
+
+# Volumes and logs
+docker/volumes/
+*.log

@@ -1,0 +1,39 @@
+services:
+  puppet-server:
+    build:
+      context: ../build/puppet-server
+      dockerfile: Dockerfile
+    image: custom-puppetserver:8.7.0
+    container_name: puppet-server
+    hostname: puppet.infra.internal
+    networks:
+      infra-net:
+        ipv4_address: 10.240.0.10
+        aliases:
+          - puppet
+          - puppet.infra.internal
+    environment:
+      JAVA_ARGS: "-Xms256m -Xmx512m -Djruby.logger.class=default"
+    volumes:
+      - devops-puppet-server-ssl:/etc/puppetlabs/puppetserver/ca
+      - devops-puppet-server-code:/etc/puppetlabs/code
+      - ../../puppet/puppet.conf:/etc/puppetlabs/puppet/puppet.conf:ro
+      - ../../puppet/manifests:/etc/puppetlabs/code/environments/production/manifests:ro
+      - ../../puppet/modules:/etc/puppetlabs/code/environments/production/modules:ro
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 1G
+
+networks:
+  infra-net:
+    name: devops-infra-net
+    external: true
+
+volumes:
+  devops-puppet-server-ssl:
+    name: devops-puppet-server-ssl
+  devops-puppet-server-code:
+    name: devops-puppet-server-code

@@ -1,0 +1,28 @@
+services:
+  node-01:
+    build:
+      context: ../build/managed-node
+      dockerfile: Dockerfile
+    image: custom-ubuntu24-managed-node:latest
+    container_name: node-01
+    hostname: node-01.infra.internal
+    networks:
+      infra-net:
+        ipv4_address: 10.240.0.101
+    restart: unless-stopped
+    # Resource limits tuned for a 16 GB development laptop
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+
+networks:
+  infra-net:
+    name: devops-infra-net
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 10.240.0.0/16
+          gateway: 10.240.0.1

@@ -1,0 +1,12 @@
+<%- | String $environment_label | -%>
+================================================================================
+                    DEVOPS MANAGED NODE - SYSTEM STATUS
+================================================================================
+ Hostname         : <%= $facts['networking']['fqdn'] %>
+ Primary IPv4     : <%= $facts['networking']['ip'] %>
+ Operating System : <%= $facts['os']['distro']['description'] %>
+ Kernel Version   : <%= $facts['kernelrelease'] %>
+ Architecture     : <%= $facts['os']['architecture'] %>
+ Environment      : <%= $environment_label %>
+ Configuration    : Managed by Puppet 8 (Manual CA Approved)
+================================================================================

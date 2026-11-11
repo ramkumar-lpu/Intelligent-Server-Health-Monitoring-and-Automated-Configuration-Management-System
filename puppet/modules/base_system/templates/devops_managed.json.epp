@@ -1,0 +1,9 @@
+<%- | String $environment_label | -%>
+{
+  "managed": true,
+  "node": "<%= $facts['networking']['fqdn'] %>",
+  "ip": "<%= $facts['networking']['ip'] %>",
+  "os": "<%= $facts['os']['distro']['description'] %>",
+  "environment": "<%= $environment_label %>",
+  "ca_verification": "manual_csr_approved"
+}
