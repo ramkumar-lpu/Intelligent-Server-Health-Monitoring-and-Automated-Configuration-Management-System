@@ -68,13 +68,51 @@ Assert-Check "All 12 containers hold their expected static IPv4 addresses" {
 
 # 3. Terraform manages exactly node-02..10 (9 resources)
 Assert-Check "Terraform state manages exactly 9 containers (node-02..10)" {
-    $statePath = Join-Path $PSScriptRoot "..\terraform\terraform.tfstate"
-    if (-not (Test-Path $statePath)) { return $false }
-    $tfState = Get-Content -Raw $statePath | ConvertFrom-Json
+    $checkedPaths = @()
+    $statePath = $null
+
+    if (-not [string]::IsNullOrWhiteSpace($env:TF_STATE_PATH)) {
+        $checkedPaths += $env:TF_STATE_PATH
+        if (Test-Path -LiteralPath $env:TF_STATE_PATH) {
+            $statePath = $env:TF_STATE_PATH
+        } else {
+            Write-Host "    [DIAG] TF_STATE_PATH is set but not found: $($env:TF_STATE_PATH)" -ForegroundColor Yellow
+            return $false
+        }
+    } else {
+        $candidates = @(
+            (Join-Path $PSScriptRoot "..\terraform\terraform.tfstate"),
+            "D:\Devops_Project\terraform\terraform.tfstate"
+        )
+        foreach ($candidate in $candidates) {
+            $checkedPaths += $candidate
+            if (Test-Path -LiteralPath $candidate) {
+                $statePath = $candidate
+                break
+            }
+        }
+    }
+
+    if (-not $statePath) {
+        Write-Host "    [DIAG] No Terraform state file found. Checked: $($checkedPaths -join '; ')" -ForegroundColor Yellow
+        return $false
+    }
+
+    $tfState = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json
     $containerRes = $tfState.resources | Where-Object { $_.type -eq 'docker_container' -and $_.name -eq 'this' }
-    if (-not $containerRes) { return $false }
-    $keys = @($containerRes.instances | ForEach-Object { $_.index_key })
-    return ($keys.Count -eq 9 -and ($keys -notcontains 'node-01'))
+    if (-not $containerRes) {
+        Write-Host "    [DIAG] Missing docker_container.this resource in state: $statePath" -ForegroundColor Yellow
+        return $false
+    }
+
+    $expectedKeys = @('node-02', 'node-03', 'node-04', 'node-05', 'node-06', 'node-07', 'node-08', 'node-09', 'node-10')
+    $actualKeys = @($containerRes.instances | ForEach-Object { [string]$_.index_key } | Sort-Object)
+    $diff = Compare-Object -ReferenceObject $expectedKeys -DifferenceObject $actualKeys
+    if ($diff -or $actualKeys.Count -ne 9) {
+        Write-Host "    [DIAG] Unexpected container keys in $($statePath): $($actualKeys -join ', ')" -ForegroundColor Yellow
+        return $false
+    }
+    return $true
 }
 
 # 4. Puppet CA has signed certificates for all 10 managed nodes and autosign=false

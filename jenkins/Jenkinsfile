@@ -53,7 +53,7 @@ pipeline {
                     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
                     docker compose -f docker/compose/puppet-server.yml config -q
                     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-                    docker compose -f docker/compose/nagios-server.yml config -q
+                    docker compose --env-file .env.example -f docker/compose/nagios-server.yml config -q
                 '''
             }
         }
