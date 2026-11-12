@@ -1,0 +1,470 @@
+#!/bin/sh
+# Cgroup-aware Nagios CPU utilization and CFS throttling plugin
+# Primary: cgroup v2 (cpu.max, cpu.stat); Fallback: cgroup v1 (cpu, cpuacct).
+# Usage: check_cpu_cgroup [-w <cpu_warn%>] [-c <cpu_crit%>] [-W <throt_warn%>] [-C <throt_crit%>] [--state-file <path>]
+
+WARN_CPU=80
+CRIT_CPU=90
+WARN_THROT=25
+CRIT_THROT=50
+MIN_PERIODS_GATE=20
+STATE_FILE="/var/tmp/check_cpu_cgroup.state"
+CGROUP_ROOT="/sys/fs/cgroup"
+UPTIME_FILE="/proc/uptime"
+
+print_usage() {
+  echo "Usage: check_cpu_cgroup [-w <cpu_warn%>] [-c <cpu_crit%>] [-W <throt_warn%>] [-C <throt_crit%>] [--state-file <path>] [--cgroup-root <dir>] [--uptime-file <path>]"
+}
+
+is_uint() {
+  case "$1" in
+    ''|*[!0-9]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+is_ufloat() {
+  awk -v v="$1" 'BEGIN { exit !(v ~ /^[0-9]+(\.[0-9]+)?$/) }'
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -w|--warning)
+      if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+        echo "UNKNOWN - Missing value for $1"
+        exit 3
+      fi
+      WARN_CPU="$2"
+      shift 2
+      ;;
+    -c|--critical)
+      if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+        echo "UNKNOWN - Missing value for $1"
+        exit 3
+      fi
+      CRIT_CPU="$2"
+      shift 2
+      ;;
+    -W|--throttle-warning)
+      if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+        echo "UNKNOWN - Missing value for $1"
+        exit 3
+      fi
+      WARN_THROT="$2"
+      shift 2
+      ;;
+    -C|--throttle-critical)
+      if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+        echo "UNKNOWN - Missing value for $1"
+        exit 3
+      fi
+      CRIT_THROT="$2"
+      shift 2
+      ;;
+    --state-file)
+      if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+        echo "UNKNOWN - Missing value for $1"
+        exit 3
+      fi
+      STATE_FILE="$2"
+      shift 2
+      ;;
+    --cgroup-root)
+      if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+        echo "UNKNOWN - Missing value for $1"
+        exit 3
+      fi
+      CGROUP_ROOT="$2"
+      shift 2
+      ;;
+    --uptime-file)
+      if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+        echo "UNKNOWN - Missing value for $1"
+        exit 3
+      fi
+      UPTIME_FILE="$2"
+      shift 2
+      ;;
+    -h|--help)
+      print_usage
+      exit 3
+      ;;
+    *)
+      echo "UNKNOWN - Invalid argument: $1"
+      print_usage
+      exit 3
+      ;;
+  esac
+done
+
+# Validate CPU thresholds
+if ! is_uint "$WARN_CPU" || ! is_uint "$CRIT_CPU"; then
+  echo "UNKNOWN - CPU thresholds must be integers 0..100 (got warn='$WARN_CPU', crit='$CRIT_CPU')"
+  exit 3
+fi
+if [ "$WARN_CPU" -lt 0 ] || [ "$WARN_CPU" -gt 100 ] || [ "$CRIT_CPU" -le 0 ] || [ "$CRIT_CPU" -gt 100 ] || [ "$WARN_CPU" -ge "$CRIT_CPU" ]; then
+  echo "UNKNOWN - Invalid CPU thresholds: require 0 <= warn ($WARN_CPU) < crit ($CRIT_CPU) <= 100"
+  exit 3
+fi
+
+# Validate throttling thresholds
+if ! is_uint "$WARN_THROT" || ! is_uint "$CRIT_THROT"; then
+  echo "UNKNOWN - Throttling thresholds must be integers 0..100 (got warn='$WARN_THROT', crit='$CRIT_THROT')"
+  exit 3
+fi
+if [ "$WARN_THROT" -lt 0 ] || [ "$WARN_THROT" -gt 100 ] || [ "$CRIT_THROT" -le 0 ] || [ "$CRIT_THROT" -gt 100 ] || [ "$WARN_THROT" -ge "$CRIT_THROT" ]; then
+  echo "UNKNOWN - Invalid throttling thresholds: require 0 <= warn ($WARN_THROT) < crit ($CRIT_THROT) <= 100"
+  exit 3
+fi
+
+if [ ! -d "$CGROUP_ROOT" ]; then
+  echo "UNKNOWN - Cgroup root directory does not exist: $CGROUP_ROOT"
+  exit 3
+fi
+
+# Read cgroup CPU quota & counters
+CG_VER=""
+ALLOWED_CORES=""
+USAGE_USEC=""
+NR_PERIODS=""
+NR_THROTTLED=""
+THROTTLED_USEC=""
+
+CGV2_MAX="${CGROUP_ROOT}/cpu.max"
+CGV2_STAT="${CGROUP_ROOT}/cpu.stat"
+CGV1_QUOTA="${CGROUP_ROOT}/cpu/cpu.cfs_quota_us"
+CGV1_PERIOD="${CGROUP_ROOT}/cpu/cpu.cfs_period_us"
+CGV1_USAGE="${CGROUP_ROOT}/cpuacct/cpuacct.usage"
+CGV1_STAT="${CGROUP_ROOT}/cpu/cpu.stat"
+
+if [ -e "$CGV2_STAT" ] || [ -e "$CGV2_MAX" ]; then
+  if [ ! -e "$CGV2_MAX" ] || [ ! -r "$CGV2_MAX" ]; then
+    echo "UNKNOWN - Missing or unreadable cgroup v2 cpu.max: $CGV2_MAX"
+    exit 3
+  fi
+  if [ ! -e "$CGV2_STAT" ] || [ ! -r "$CGV2_STAT" ]; then
+    echo "UNKNOWN - Missing or unreadable cgroup v2 cpu.stat: $CGV2_STAT"
+    exit 3
+  fi
+  CG_VER="cgroup v2"
+
+  RAW_MAX=$(cat "$CGV2_MAX" 2>/dev/null)
+  QUOTA_VAL=$(printf '%s\n' "$RAW_MAX" | awk '{print $1}')
+  PERIOD_VAL=$(printf '%s\n' "$RAW_MAX" | awk '{print $2}')
+
+  if [ "$QUOTA_VAL" = "max" ]; then
+    if ! is_uint "$PERIOD_VAL" || [ "$PERIOD_VAL" -le 0 ]; then
+      echo "UNKNOWN - Invalid cgroup v2 cpu.max period for unlimited quota: '$RAW_MAX'"
+      exit 3
+    fi
+    HOST_CPUS=$(nproc 2>/dev/null)
+    if ! is_uint "$HOST_CPUS" || [ "$HOST_CPUS" -le 0 ]; then
+      echo "UNKNOWN - Unable to determine CPU count for unlimited cgroup v2 quota"
+      exit 3
+    fi
+    ALLOWED_CORES=$(awk -v c="$HOST_CPUS" 'BEGIN { printf "%.2f", c }')
+  else
+    if ! is_uint "$QUOTA_VAL" || ! is_uint "$PERIOD_VAL" || [ "$QUOTA_VAL" -le 0 ] || [ "$PERIOD_VAL" -le 0 ]; then
+      echo "UNKNOWN - Invalid cgroup v2 cpu.max values: '$RAW_MAX'"
+      exit 3
+    fi
+    ALLOWED_CORES=$(awk -v q="$QUOTA_VAL" -v p="$PERIOD_VAL" 'BEGIN { printf "%.2f", q / p }')
+  fi
+
+  USAGE_USEC=$(awk '/^usage_usec / {print $2; exit}' "$CGV2_STAT" 2>/dev/null)
+  NR_PERIODS=$(awk '/^nr_periods / {print $2; exit}' "$CGV2_STAT" 2>/dev/null)
+  NR_THROTTLED=$(awk '/^nr_throttled / {print $2; exit}' "$CGV2_STAT" 2>/dev/null)
+  THROTTLED_USEC=$(awk '/^throttled_usec / {print $2; exit}' "$CGV2_STAT" 2>/dev/null)
+
+elif [ -e "$CGV1_QUOTA" ] && [ -e "$CGV1_USAGE" ]; then
+  if [ ! -r "$CGV1_QUOTA" ] || [ ! -r "$CGV1_PERIOD" ] || [ ! -r "$CGV1_USAGE" ]; then
+    echo "UNKNOWN - Unreadable cgroup v1 CPU files under $CGROUP_ROOT"
+    exit 3
+  fi
+  CG_VER="cgroup v1"
+  QUOTA_VAL=$(tr -d ' \t\r\n' < "$CGV1_QUOTA" 2>/dev/null)
+  PERIOD_VAL=$(tr -d ' \t\r\n' < "$CGV1_PERIOD" 2>/dev/null)
+
+  if [ "$QUOTA_VAL" = "-1" ]; then
+    HOST_CPUS=$(nproc 2>/dev/null)
+    if ! is_uint "$HOST_CPUS" || [ "$HOST_CPUS" -le 0 ]; then
+      echo "UNKNOWN - Unable to determine CPU count for unconstrained cgroup v1"
+      exit 3
+    fi
+    ALLOWED_CORES=$(awk -v c="$HOST_CPUS" 'BEGIN { printf "%.2f", c }')
+  else
+    if ! is_uint "$QUOTA_VAL" || ! is_uint "$PERIOD_VAL" || [ "$QUOTA_VAL" -le 0 ] || [ "$PERIOD_VAL" -le 0 ]; then
+      echo "UNKNOWN - Invalid cgroup v1 quota/period: '$QUOTA_VAL' / '$PERIOD_VAL'"
+      exit 3
+    fi
+    ALLOWED_CORES=$(awk -v q="$QUOTA_VAL" -v p="$PERIOD_VAL" 'BEGIN { printf "%.2f", q / p }')
+  fi
+
+  USAGE_NS=$(tr -d ' \t\r\n' < "$CGV1_USAGE" 2>/dev/null)
+  if ! is_uint "$USAGE_NS"; then
+    echo "UNKNOWN - Invalid cgroup v1 cpuacct.usage: '$USAGE_NS'"
+    exit 3
+  fi
+  USAGE_USEC=$(awk -v ns="$USAGE_NS" 'BEGIN { printf "%.0f", ns / 1000 }')
+
+  if [ -e "$CGV1_STAT" ]; then
+    if [ ! -r "$CGV1_STAT" ]; then
+      echo "UNKNOWN - Unreadable cgroup v1 cpu.stat: $CGV1_STAT"
+      exit 3
+    fi
+    NR_PERIODS=$(awk '/^nr_periods / {print $2; exit}' "$CGV1_STAT" 2>/dev/null)
+    NR_THROTTLED=$(awk '/^nr_throttled / {print $2; exit}' "$CGV1_STAT" 2>/dev/null)
+    TN_VAL=$(awk '/^throttled_time / {print $2; exit}' "$CGV1_STAT" 2>/dev/null)
+    if is_uint "$TN_VAL"; then
+      THROTTLED_USEC=$(awk -v ns="$TN_VAL" 'BEGIN { printf "%.0f", ns / 1000 }')
+    fi
+  else
+    NR_PERIODS="0"
+    NR_THROTTLED="0"
+    THROTTLED_USEC="0"
+  fi
+else
+  echo "UNKNOWN - Neither cgroup v2 nor cgroup v1 CPU metrics found under $CGROUP_ROOT"
+  exit 3
+fi
+
+if ! is_uint "$USAGE_USEC" || ! is_uint "$NR_PERIODS" || ! is_uint "$NR_THROTTLED" || ! is_uint "$THROTTLED_USEC"; then
+  echo "UNKNOWN - Missing or invalid cgroup CPU counters (usage='$USAGE_USEC', periods='$NR_PERIODS', throttled='$NR_THROTTLED', throttled_usec='$THROTTLED_USEC')"
+  exit 3
+fi
+
+# Monotonic clock source (uptime primary, date fallback)
+CLOCK_SRC=""
+TS_USEC=""
+if [ -r "$UPTIME_FILE" ]; then
+  UP_VAL=$(awk '{print $1; exit}' "$UPTIME_FILE" 2>/dev/null)
+  if is_ufloat "$UP_VAL"; then
+    TS_USEC=$(awk -v u="$UP_VAL" 'BEGIN { printf "%.0f", u * 1000000 }')
+    CLOCK_SRC="mono"
+  fi
+fi
+
+if [ -z "$TS_USEC" ]; then
+  NS_VAL=$(date +%s%N 2>/dev/null)
+  if is_uint "$NS_VAL" && [ "${#NS_VAL}" -gt 10 ]; then
+    TS_USEC=$(awk -v n="$NS_VAL" 'BEGIN { printf "%.0f", n / 1000 }')
+    CLOCK_SRC="wall"
+  else
+    SEC_VAL=$(date +%s 2>/dev/null)
+    if ! is_uint "$SEC_VAL"; then
+      echo "UNKNOWN - Failed to read system clock"
+      exit 3
+    fi
+    TS_USEC=$(awk -v s="$SEC_VAL" 'BEGIN { printf "%.0f", s * 1000000 }')
+    CLOCK_SRC="wall"
+  fi
+fi
+
+# Safeguards: reject symlinks, non-regular files, ownership mismatches, and bad perms
+CUR_UID=$(id -u 2>/dev/null)
+STATE_DIR=$(dirname "$STATE_FILE")
+LOCK_FILE="${STATE_FILE}.lock"
+
+if [ ! -d "$STATE_DIR" ] || [ -L "$STATE_DIR" ] || [ ! -w "$STATE_DIR" ] || [ ! -x "$STATE_DIR" ]; then
+  echo "UNKNOWN - State directory missing, symlinked, or not writable: $STATE_DIR"
+  exit 3
+fi
+
+validate_existing_file() {
+  TARGET="$1"
+  LABEL="$2"
+  if [ -L "$TARGET" ]; then
+    echo "UNKNOWN - Refusing symlinked $LABEL file: $TARGET"
+    exit 3
+  fi
+  if [ -e "$TARGET" ]; then
+    if [ ! -f "$TARGET" ]; then
+      echo "UNKNOWN - Refusing non-regular $LABEL file: $TARGET"
+      exit 3
+    fi
+    FILE_UID=$(stat -c '%u' "$TARGET" 2>/dev/null)
+    if [ -z "$FILE_UID" ] || [ "$FILE_UID" != "$CUR_UID" ]; then
+      echo "UNKNOWN - $LABEL file ownership mismatch (expected uid=$CUR_UID, got uid='$FILE_UID'): $TARGET"
+      exit 3
+    fi
+    if [ ! -r "$TARGET" ] || [ ! -w "$TARGET" ]; then
+      echo "UNKNOWN - $LABEL file permissions deny read/write for uid=$CUR_UID: $TARGET"
+      exit 3
+    fi
+  fi
+}
+
+validate_existing_file "$STATE_FILE" "state"
+validate_existing_file "$LOCK_FILE" "lock"
+
+# Open FD 9 explicitly and lock exclusively
+exec 9>"$LOCK_FILE" 2>/dev/null || {
+  echo "UNKNOWN - Cannot open lock file: $LOCK_FILE"
+  exit 3
+}
+
+# Re-check lock file is still non-symlink regular file after open
+if [ -L "$LOCK_FILE" ] || [ ! -f "$LOCK_FILE" ]; then
+  echo "UNKNOWN - Lock file became symlink or non-regular file: $LOCK_FILE"
+  exit 3
+fi
+
+if ! flock -x -w 2 9; then
+  echo "UNKNOWN - Timed out waiting for exclusive lock on $LOCK_FILE"
+  exit 3
+fi
+
+write_state_atomic() {
+  TMP_FILE=$(mktemp "${STATE_FILE}.XXXXXX" 2>/dev/null) || {
+    echo "UNKNOWN - Failed to create temporary state file in $STATE_DIR"
+    exit 3
+  }
+  if ! printf '%s %s %s %s %s %s\n' "$CLOCK_SRC" "$TS_USEC" "$USAGE_USEC" "$NR_PERIODS" "$NR_THROTTLED" "$THROTTLED_USEC" > "$TMP_FILE"; then
+    rm -f "$TMP_FILE"
+    echo "UNKNOWN - Failed writing temporary state file"
+    exit 3
+  fi
+  chmod 0644 "$TMP_FILE" 2>/dev/null
+  if ! mv -f "$TMP_FILE" "$STATE_FILE"; then
+    rm -f "$TMP_FILE"
+    echo "UNKNOWN - Failed replacing state file $STATE_FILE"
+    exit 3
+  fi
+}
+
+# First execution: initialize baseline without emitting fake metrics
+if [ ! -e "$STATE_FILE" ]; then
+  write_state_atomic
+  echo "OK - [$CG_VER] Baseline initialized (quota=${ALLOWED_CORES} core(s), clock=${CLOCK_SRC}); utilization will be reported on next check"
+  exit 0
+fi
+
+PREV_LINE=$(cat "$STATE_FILE" 2>/dev/null)
+PREV_FIELDS=$(printf '%s\n' "$PREV_LINE" | awk '{print NF}')
+if [ "$PREV_FIELDS" != "6" ]; then
+  write_state_atomic
+  echo "UNKNOWN - Corrupted state file detected (unexpected field count); baseline re-initialized for next check"
+  exit 3
+fi
+
+PREV_SRC=$(printf '%s\n' "$PREV_LINE" | awk '{print $1}')
+PREV_TS=$(printf '%s\n' "$PREV_LINE" | awk '{print $2}')
+PREV_USAGE=$(printf '%s\n' "$PREV_LINE" | awk '{print $3}')
+PREV_PERIODS=$(printf '%s\n' "$PREV_LINE" | awk '{print $4}')
+PREV_THROTTLED=$(printf '%s\n' "$PREV_LINE" | awk '{print $5}')
+PREV_THROT_USEC=$(printf '%s\n' "$PREV_LINE" | awk '{print $6}')
+
+if [ "$PREV_SRC" != "mono" ] && [ "$PREV_SRC" != "wall" ]; then
+  write_state_atomic
+  echo "UNKNOWN - Corrupted state clock source ('$PREV_SRC'); baseline re-initialized for next check"
+  exit 3
+fi
+
+if ! is_uint "$PREV_TS" || ! is_uint "$PREV_USAGE" || ! is_uint "$PREV_PERIODS" || ! is_uint "$PREV_THROTTLED" || ! is_uint "$PREV_THROT_USEC"; then
+  write_state_atomic
+  echo "UNKNOWN - Corrupted numeric state detected; baseline re-initialized for next check"
+  exit 3
+fi
+
+# Handle clock source change or wall-clock regression vs counter reset
+CLOCK_CHANGED=$(awk -v ps="$PREV_SRC" -v cs="$CLOCK_SRC" -v pt="$PREV_TS" -v ct="$TS_USEC" \
+  'BEGIN { print (ps != cs || ct < pt) ? 1 : 0 }')
+
+if [ "$CLOCK_CHANGED" -eq 1 ]; then
+  write_state_atomic
+  echo "OK - [$CG_VER] Clock source change or regression detected; baseline re-initialized (quota=${ALLOWED_CORES} core(s))"
+  exit 0
+fi
+
+COUNTER_RESET=$(awk -v pu="$PREV_USAGE" -v cu="$USAGE_USEC" \
+  -v pp="$PREV_PERIODS" -v cp="$NR_PERIODS" \
+  -v pth="$PREV_THROTTLED" -v cth="$NR_THROTTLED" \
+  -v ptu="$PREV_THROT_USEC" -v ctu="$THROTTLED_USEC" \
+  'BEGIN { print (cu < pu || cp < pp || cth < pth || ctu < ptu) ? 1 : 0 }')
+
+if [ "$COUNTER_RESET" -eq 1 ]; then
+  write_state_atomic
+  echo "OK - [$CG_VER] Counter reset detected (container restart); baseline re-initialized (quota=${ALLOWED_CORES} core(s))"
+  exit 0
+fi
+
+DT_USEC=$(awk -v ct="$TS_USEC" -v pt="$PREV_TS" 'BEGIN { printf "%.0f", ct - pt }')
+
+# Preserve baseline when interval < 1 second
+SHORT_INT=$(awk -v d="$DT_USEC" 'BEGIN { print (d < 1000000) ? 1 : 0 }')
+if [ "$SHORT_INT" -eq 1 ]; then
+  ELAPSED_S=$(awk -v d="$DT_USEC" 'BEGIN { printf "%.2f", d / 1000000.0 }')
+  echo "OK - [$CG_VER] Sampling interval too short (< 1.0s; elapsed=${ELAPSED_S}s); preserving baseline"
+  exit 0
+fi
+
+# Compute deltas
+D_USAGE=$(awk -v c="$USAGE_USEC" -v p="$PREV_USAGE" 'BEGIN { printf "%.0f", c - p }')
+D_PERIODS=$(awk -v c="$NR_PERIODS" -v p="$PREV_PERIODS" 'BEGIN { printf "%.0f", c - p }')
+D_THROTTLED=$(awk -v c="$NR_THROTTLED" -v p="$PREV_THROTTLED" 'BEGIN { printf "%.0f", c - p }')
+D_THROT_USEC=$(awk -v c="$THROTTLED_USEC" -v p="$PREV_THROT_USEC" 'BEGIN { printf "%.0f", c - p }')
+
+# Validate Delta nr_throttled <= Delta nr_periods before overwriting baseline or reporting
+THROT_INVALID=$(awk -v dth="$D_THROTTLED" -v dp="$D_PERIODS" 'BEGIN { print (dth > dp) ? 1 : 0 }')
+if [ "$THROT_INVALID" -eq 1 ]; then
+  echo "UNKNOWN - Invalid cgroup counters: delta nr_throttled (${D_THROTTLED}) > delta nr_periods (${D_PERIODS})"
+  exit 3
+fi
+
+write_state_atomic
+
+# Compute CPU utilization (clamped only if minor <= 105% CFS boundary jitter; flag impossible values)
+RAW_CPU_PCT=$(awk -v du="$D_USAGE" -v dt="$DT_USEC" -v ac="$ALLOWED_CORES" \
+  'BEGIN { printf "%.4f", (du * 100.0) / (dt * ac) }')
+
+CPU_EXCESSIVE=$(awk -v p="$RAW_CPU_PCT" 'BEGIN { print (p > 105.0 || p < 0.0) ? 1 : 0 }')
+if [ "$CPU_EXCESSIVE" -eq 1 ]; then
+  echo "UNKNOWN - Invalid CPU utilization measurement (${RAW_CPU_PCT}% of ${ALLOWED_CORES} core(s))"
+  exit 3
+fi
+
+CPU_PCT=$(awk -v p="$RAW_CPU_PCT" 'BEGIN { if (p > 100.0) p = 100.0; printf "%.1f", p }')
+
+THROT_MS=$(awk -v dtu="$D_THROT_USEC" 'BEGIN { printf "%.1f", dtu / 1000.0 }')
+THROT_SEC=$(awk -v dtu="$D_THROT_USEC" 'BEGIN { printf "%.3f", dtu / 1000000.0 }')
+ELAPSED_S=$(awk -v dt="$DT_USEC" 'BEGIN { printf "%.1f", dt / 1000000.0 }')
+THROT_RATE=$(awk -v dtu="$D_THROT_USEC" -v dt="$DT_USEC" 'BEGIN { printf "%.2f", (dtu / 1000.0) / (dt / 1000000.0) }')
+
+# Evaluate thresholds (with minimum active periods gate for throttling)
+STATUS=0
+STATUS_LABEL="OK"
+
+CPU_STATE=$(awk -v v="$CPU_PCT" -v w="$WARN_CPU" -v c="$CRIT_CPU" \
+  'BEGIN { if (v >= c) print 2; else if (v >= w) print 1; else print 0 }')
+
+THROT_STATE=0
+THROT_TEXT=""
+PERF_DATA="cpu_used=${CPU_PCT}%;${WARN_CPU};${CRIT_CPU};0;100"
+
+if [ "$D_PERIODS" -eq 0 ]; then
+  THROT_TEXT="Throttled periods: N/A (0 active periods)"
+else
+  THROT_PCT=$(awk -v dth="$D_THROTTLED" -v dp="$D_PERIODS" 'BEGIN { printf "%.1f", (dth * 100.0) / dp }')
+  GATE_NOTE=""
+  if [ "$D_PERIODS" -ge "$MIN_PERIODS_GATE" ]; then
+    THROT_STATE=$(awk -v v="$THROT_PCT" -v w="$WARN_THROT" -v c="$CRIT_THROT" \
+      'BEGIN { if (v >= c) print 2; else if (v >= w) print 1; else print 0 }')
+  else
+    GATE_NOTE=" (throttling gated: ${D_PERIODS}<${MIN_PERIODS_GATE} periods)"
+  fi
+  THROT_TEXT="Throttled periods: ${THROT_PCT}% (${D_THROTTLED}/${D_PERIODS})${GATE_NOTE}"
+  PERF_DATA="${PERF_DATA} throttled_periods=${THROT_PCT}%;${WARN_THROT};${CRIT_THROT};0;100"
+fi
+
+PERF_DATA="${PERF_DATA} throttled_time=${THROT_SEC}s;;;0;"
+
+if [ "$CPU_STATE" -eq 2 ] || [ "$THROT_STATE" -eq 2 ]; then
+  STATUS=2
+  STATUS_LABEL="CRITICAL"
+elif [ "$CPU_STATE" -eq 1 ] || [ "$THROT_STATE" -eq 1 ]; then
+  STATUS=1
+  STATUS_LABEL="WARNING"
+fi
+
+echo "${STATUS_LABEL} - [${CG_VER}] CPU: ${CPU_PCT}% of ${ALLOWED_CORES} core(s), ${THROT_TEXT}, Throttled task time: ${THROT_MS}ms (${THROT_RATE}ms/s over ${ELAPSED_S}s) | ${PERF_DATA}"
+exit "$STATUS"

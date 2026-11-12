@@ -1,0 +1,199 @@
+#!/bin/sh
+# Cgroup-aware Nagios memory check plugin for containerized managed nodes
+# Supports cgroup v2, cgroup v1, and /proc/meminfo fallback when unconstrained.
+# Usage: check_mem_cgroup [-w <warn_pct>] [-c <crit_pct>]
+
+WARN=80
+CRIT=90
+
+print_usage() {
+  echo "Usage: check_mem_cgroup [-w <warn_pct>] [-c <crit_pct>]"
+}
+
+is_uint() {
+  case "$1" in
+    ''|*[!0-9]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+read_trimmed() {
+  tr -d ' \t\r\n' < "$1" 2>/dev/null
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -w|--warning)
+      if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+        echo "UNKNOWN - Missing value for $1"
+        exit 3
+      fi
+      WARN="$2"
+      shift 2
+      ;;
+    -c|--critical)
+      if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+        echo "UNKNOWN - Missing value for $1"
+        exit 3
+      fi
+      CRIT="$2"
+      shift 2
+      ;;
+    -h|--help)
+      print_usage
+      exit 3
+      ;;
+    *)
+      echo "UNKNOWN - Invalid argument: $1"
+      print_usage
+      exit 3
+      ;;
+  esac
+done
+
+# Validate warning and critical thresholds
+if ! is_uint "$WARN" || ! is_uint "$CRIT"; then
+  echo "UNKNOWN - Thresholds must be integers between 0 and 100 (got warn='$WARN', crit='$CRIT')"
+  exit 3
+fi
+
+if [ "$WARN" -lt 0 ] || [ "$WARN" -gt 100 ] || [ "$CRIT" -le 0 ] || [ "$CRIT" -gt 100 ] || [ "$WARN" -ge "$CRIT" ]; then
+  echo "UNKNOWN - Invalid thresholds: require 0 <= warn ($WARN) < crit ($CRIT) <= 100"
+  exit 3
+fi
+
+CGV2_MAX="/sys/fs/cgroup/memory.max"
+CGV2_CUR="/sys/fs/cgroup/memory.current"
+CGV1_MAX="/sys/fs/cgroup/memory/memory.limit_in_bytes"
+CGV1_CUR="/sys/fs/cgroup/memory/memory.usage_in_bytes"
+PROC_MEMINFO="/proc/meminfo"
+
+SOURCE=""
+MEM_LIMIT=""
+MEM_USED=""
+
+# 1. Detect cgroup v2
+if [ -e "$CGV2_MAX" ]; then
+  if [ ! -r "$CGV2_MAX" ]; then
+    echo "UNKNOWN - Cannot read $CGV2_MAX"
+    exit 3
+  fi
+  RAW_MAX=$(read_trimmed "$CGV2_MAX")
+  if [ -z "$RAW_MAX" ]; then
+    echo "UNKNOWN - Empty value in $CGV2_MAX"
+    exit 3
+  fi
+
+  if [ "$RAW_MAX" != "max" ]; then
+    if ! is_uint "$RAW_MAX"; then
+      echo "UNKNOWN - Invalid numeric value in $CGV2_MAX: '$RAW_MAX'"
+      exit 3
+    fi
+    if [ ! -e "$CGV2_CUR" ] || [ ! -r "$CGV2_CUR" ]; then
+      echo "UNKNOWN - Missing or unreadable $CGV2_CUR"
+      exit 3
+    fi
+    RAW_CUR=$(read_trimmed "$CGV2_CUR")
+    if ! is_uint "$RAW_CUR"; then
+      echo "UNKNOWN - Invalid numeric value in $CGV2_CUR: '$RAW_CUR'"
+      exit 3
+    fi
+    SOURCE="cgroup v2"
+    MEM_LIMIT="$RAW_MAX"
+    MEM_USED="$RAW_CUR"
+  fi
+fi
+
+# 2. Detect cgroup v1 (only if not resolved by cgroup v2)
+if [ -z "$SOURCE" ] && [ -e "$CGV1_MAX" ]; then
+  if [ ! -r "$CGV1_MAX" ]; then
+    echo "UNKNOWN - Cannot read $CGV1_MAX"
+    exit 3
+  fi
+  RAW_MAX=$(read_trimmed "$CGV1_MAX")
+  if ! is_uint "$RAW_MAX"; then
+    echo "UNKNOWN - Invalid numeric value in $CGV1_MAX: '$RAW_MAX'"
+    exit 3
+  fi
+
+  # Check if cgroup v1 limit is unconstrained (kernel sentinel >= 9223372036854771712 or > host RAM)
+  IS_UNCONSTRAINED=$(awk -v lim="$RAW_MAX" 'BEGIN { print (lim >= 9223372036854771712) ? 1 : 0 }')
+  if [ "$IS_UNCONSTRAINED" -eq 0 ] && [ -r "$PROC_MEMINFO" ]; then
+    HOST_KB=$(awk '/^MemTotal:/ {print $2; exit}' "$PROC_MEMINFO" 2>/dev/null)
+    if is_uint "$HOST_KB" && [ "$HOST_KB" -gt 0 ]; then
+      IS_UNCONSTRAINED=$(awk -v lim="$RAW_MAX" -v hkb="$HOST_KB" 'BEGIN { print (lim > (hkb * 1024)) ? 1 : 0 }')
+    fi
+  fi
+
+  if [ "$IS_UNCONSTRAINED" -eq 0 ]; then
+    if [ ! -e "$CGV1_CUR" ] || [ ! -r "$CGV1_CUR" ]; then
+      echo "UNKNOWN - Missing or unreadable $CGV1_CUR"
+      exit 3
+    fi
+    RAW_CUR=$(read_trimmed "$CGV1_CUR")
+    if ! is_uint "$RAW_CUR"; then
+      echo "UNKNOWN - Invalid numeric value in $CGV1_CUR: '$RAW_CUR'"
+      exit 3
+    fi
+    SOURCE="cgroup v1"
+    MEM_LIMIT="$RAW_MAX"
+    MEM_USED="$RAW_CUR"
+  fi
+fi
+
+# 3. Fallback to /proc/meminfo when unconstrained
+if [ -z "$SOURCE" ]; then
+  if [ ! -r "$PROC_MEMINFO" ]; then
+    echo "UNKNOWN - Cgroup memory unconstrained/absent and cannot read $PROC_MEMINFO"
+    exit 3
+  fi
+  TOTAL_KB=$(awk '/^MemTotal:/ {print $2; exit}' "$PROC_MEMINFO" 2>/dev/null)
+  AVAIL_KB=$(awk '/^MemAvailable:/ {print $2; exit}' "$PROC_MEMINFO" 2>/dev/null)
+
+  if ! is_uint "$TOTAL_KB" || ! is_uint "$AVAIL_KB"; then
+    echo "UNKNOWN - Invalid or missing MemTotal/MemAvailable in $PROC_MEMINFO"
+    exit 3
+  fi
+
+  if awk -v t="$TOTAL_KB" -v a="$AVAIL_KB" 'BEGIN { exit !(t <= 0 || a > t) }'; then
+    echo "UNKNOWN - Inconsistent values in $PROC_MEMINFO (MemTotal=${TOTAL_KB}kB, MemAvailable=${AVAIL_KB}kB)"
+    exit 3
+  fi
+
+  SOURCE="host fallback"
+  MEM_LIMIT=$(awk -v t="$TOTAL_KB" 'BEGIN { printf "%.0f", t * 1024 }')
+  MEM_USED=$(awk -v t="$TOTAL_KB" -v a="$AVAIL_KB" 'BEGIN { printf "%.0f", (t - a) * 1024 }')
+fi
+
+# 4. Validate limits & arithmetic safety
+if ! is_uint "$MEM_LIMIT" || ! is_uint "$MEM_USED"; then
+  echo "UNKNOWN - Non-numeric memory computation (limit='$MEM_LIMIT', used='$MEM_USED')"
+  exit 3
+fi
+
+if awk -v l="$MEM_LIMIT" -v u="$MEM_USED" 'BEGIN { exit !(l <= 0 || u < 0) }'; then
+  echo "UNKNOWN - Zero or negative memory limit/usage (limit=${MEM_LIMIT}, used=${MEM_USED})"
+  exit 3
+fi
+
+USED_PCT=$(awk -v u="$MEM_USED" -v l="$MEM_LIMIT" 'BEGIN { printf "%d", (u * 100) / l }')
+USED_MIB=$(awk -v u="$MEM_USED" 'BEGIN { printf "%.1f", u / 1048576 }')
+LIMIT_MIB=$(awk -v l="$MEM_LIMIT" 'BEGIN { printf "%.1f", l / 1048576 }')
+
+if ! is_uint "$USED_PCT"; then
+  echo "UNKNOWN - Failed to compute memory usage percentage"
+  exit 3
+fi
+
+OUTPUT="[$SOURCE] Memory: ${USED_PCT}% used (${USED_MIB} MiB / ${LIMIT_MIB} MiB; ${MEM_USED} / ${MEM_LIMIT} bytes) | mem_used=${USED_PCT}%;${WARN};${CRIT};0;100"
+
+if [ "$USED_PCT" -ge "$CRIT" ]; then
+  echo "CRITICAL - ${OUTPUT}"
+  exit 2
+elif [ "$USED_PCT" -ge "$WARN" ]; then
+  echo "WARNING - ${OUTPUT}"
+  exit 1
+else
+  echo "OK - ${OUTPUT}"
+  exit 0
+fi

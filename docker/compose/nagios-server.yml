@@ -1,0 +1,44 @@
+version: '3.8'
+
+services:
+  nagios-server:
+    build:
+      context: ../build/nagios
+      dockerfile: Dockerfile
+    container_name: nagios-server
+    hostname: nagios.infra.internal
+    environment:
+      - NAGIOSADMIN_USER=${NAGIOSADMIN_USER:-nagiosadmin}
+      - NAGIOSADMIN_PASS=${NAGIOSADMIN_PASS}
+      - NAGIOS_TIMEZONE=UTC
+    ports:
+      - "8085:80"
+    networks:
+      infra-net:
+        ipv4_address: 10.240.0.20
+    volumes:
+      - devops-nagios-var:/opt/nagios/var
+      - devops-nagios-spool:/opt/nagios/var/spool
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+    healthcheck:
+      test: ["CMD-SHELL", "/usr/bin/pgrep -x nagios >/dev/null && /usr/bin/pgrep -x apache2 >/dev/null && /usr/bin/curl -s -o /dev/null -w '%{http_code}' http://localhost/nagios/ | /usr/bin/grep -qE '^(200|401)$' || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    restart: unless-stopped
+
+networks:
+  infra-net:
+    external: true
+    name: devops-infra-net
+
+volumes:
+  devops-nagios-var:
+    name: devops-nagios-var
+  devops-nagios-spool:
+    name: devops-nagios-spool
