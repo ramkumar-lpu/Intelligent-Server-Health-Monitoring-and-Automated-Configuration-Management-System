@@ -13,7 +13,8 @@ COPY config/objects/commands.cfg /opt/nagios/etc/objects/commands.cfg
 COPY config/objects/contacts.cfg /opt/nagios/etc/objects/contacts.cfg
 COPY config/objects/timeperiods.cfg /opt/nagios/etc/objects/timeperiods.cfg
 COPY config/objects/templates.cfg /opt/nagios/etc/objects/templates.cfg
-COPY config/objects/hosts/node-01.cfg /opt/nagios/etc/conf.d/node-01.cfg
+COPY config/objects/localhost.cfg /opt/nagios/etc/objects/localhost.cfg
+COPY config/objects/hosts/*.cfg /opt/nagios/etc/conf.d/
 
 # Fix permissions to match nagios user and group
 RUN chown -R nagios:nagios /opt/nagios/etc/

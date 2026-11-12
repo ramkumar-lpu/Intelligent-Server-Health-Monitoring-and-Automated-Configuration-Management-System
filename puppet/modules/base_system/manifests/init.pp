@@ -1,6 +1,11 @@
 class base_system (
   String $environment_label = 'production'
 ) {
+  exec { 'apt_update':
+    command => '/usr/bin/apt-get update -qq',
+    unless  => '/bin/sh -c "ls /var/lib/apt/lists/*Packages* >/dev/null 2>&1"',
+  }
+
   file { '/etc/motd':
     ensure  => file,
     owner   => 'root',

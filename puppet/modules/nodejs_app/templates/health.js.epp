@@ -1,0 +1,7 @@
+const http = require('http');
+const port = 3000;
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ status: 'ok', node: '<%= $facts['networking']['fqdn'] %>' }));
+});
+server.listen(port, '127.0.0.1');

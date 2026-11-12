@@ -1,8 +1,11 @@
-# Nagios Core Docker Build Directory (Scheduled for Phase 3)
+# Nagios Core Docker Build Directory
 
-This directory will contain the Dockerfile and configuration assets for the custom Nagios Core monitoring server.
+This directory contains the Dockerfile and configuration assets for the Nagios Core 4.5.2 monitoring server (`10.240.0.20`, Web UI on host port `8085`).
 
-## Planned Assets
-- `Dockerfile`: Multi-stage compilation of Nagios Core 4.5 and `check_nrpe` plugin.
-- `entrypoint.sh`: Bootstraps Nagios daemon and Apache/lighttpd web server on port 8085.
-- `configs/`: Standardized templates for hosts, hostgroups, and service checks.
+## Assets
+
+- `Dockerfile`: Based on `jasonrivers/nagios:4.5.2`, copies Nagios and object configurations into `/opt/nagios/etc/`.
+- `config/nagios.cfg`: Main Nagios configuration (`cfg_dir=/opt/nagios/etc/conf.d`).
+- `config/cgi.cfg`: Web UI authorization configuration.
+- `config/objects/commands.cfg`: Includes `check_nrpe`, `check_nrpe_timeout`, `check_nrpe_mem_cgroup`, and `check_nrpe_cpu_cgroup`.
+- `config/objects/hosts/node-01.cfg` .. `node-10.cfg`: Host and 8-service definitions (`PING`, `SSH`, `Host Load - Shared Kernel`, `Memory Usage`, `Root Partition`, `Current Users`, `Total Processes`, `Container CPU - Cgroup`) for all 10 managed nodes.

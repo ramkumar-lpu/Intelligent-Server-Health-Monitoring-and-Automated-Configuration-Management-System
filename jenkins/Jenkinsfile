@@ -1,0 +1,107 @@
+pipeline {
+    agent any
+
+    parameters {
+        booleanParam(
+            name: 'RUN_INTEGRATION_CHECKS',
+            defaultValue: true,
+            description: 'Run live container, Puppet, and Nagios validation scripts'
+        )
+        booleanParam(
+            name: 'ENABLE_DEPLOY_GATE',
+            defaultValue: false,
+            description: 'Enable manual approval gate for Terraform apply / Puppet catalog rollout'
+        )
+    }
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Terraform Format & Validate') {
+            steps {
+                powershell '''
+                    docker run --rm -v "$($env:WORKSPACE)\\terraform:/work" -w /work hashicorp/terraform:latest fmt -check -recursive
+                    docker run --rm -v "$($env:WORKSPACE)\\terraform:/work" -w /work hashicorp/terraform:latest init -backend=false -input=false
+                    docker run --rm -v "$($env:WORKSPACE)\\terraform:/work" -w /work hashicorp/terraform:latest validate
+                '''
+            }
+        }
+
+        stage('Puppet Manifest Validation') {
+            steps {
+                powershell '''
+                    docker exec puppet-server bash -c "puppet parser validate /etc/puppetlabs/code/environments/production/manifests/site.pp /etc/puppetlabs/code/environments/production/modules/*/manifests/*.pp"
+                '''
+            }
+        }
+
+        stage('Dockerfile & Script Checks') {
+            steps {
+                powershell '''
+                    docker run --rm -v "$($env:WORKSPACE):/work" -w /work ubuntu:24.04 sh -n docker/build/managed-node/entrypoint.sh docker/build/managed-node/scripts/check_mem docker/build/managed-node/scripts/check_mem_cgroup docker/build/managed-node/scripts/check_cpu_cgroup
+                    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+                    docker compose -f docker/compose/docker-compose.yml config -q
+                    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+                    docker compose -f docker/compose/puppet-server.yml config -q
+                    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+                    docker compose -f docker/compose/nagios-server.yml config -q
+                '''
+            }
+        }
+
+        stage('Nagios Configuration Validation') {
+            steps {
+                powershell '''
+                    docker exec nagios-server /opt/nagios/bin/nagios -v /opt/nagios/etc/nagios.cfg
+                '''
+            }
+        }
+
+        stage('Automated Verification Scripts') {
+            when {
+                expression { return params.RUN_INTEGRATION_CHECKS }
+            }
+            steps {
+                powershell '''
+                    & "$env:WORKSPACE\\scripts\\verify-phase1.ps1"
+                    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+                    & "$env:WORKSPACE\\scripts\\verify-phase2.ps1"
+                    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+                    & "$env:WORKSPACE\\scripts\\verify-phase3.ps1"
+                    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+                    & "$env:WORKSPACE\\scripts\\verify-phase4.ps1"
+                '''
+            }
+        }
+
+        stage('Manual Approval & Controlled Rollout') {
+            when {
+                expression { return params.ENABLE_DEPLOY_GATE }
+            }
+            steps {
+                input message: 'Approve Terraform plan/apply and controlled Puppet rollout?', ok: 'Proceed'
+                powershell '''
+                    docker run --rm -v "$($env:WORKSPACE)\\terraform:/work" -v //var/run/docker.sock:/var/run/docker.sock -w /work hashicorp/terraform:latest plan -input=false
+                '''
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'All validation stages completed successfully.'
+        }
+        failure {
+            echo 'Pipeline validation failed. Inspect stage logs before any deployment.'
+        }
+    }
+}

@@ -1,0 +1,8 @@
+# Non-secret example overrides for Phase 4 Terraform provisioning.
+# Copy to terraform.tfvars only if you need to override defaults locally.
+# Do NOT store passwords, tokens, or private keys in this file.
+
+docker_host        = "unix:///var/run/docker.sock"
+network_name       = "devops-infra-net"
+managed_node_image = "custom-ubuntu24-managed-node:monitoring-v2.1"
+domain_suffix      = "infra.internal"

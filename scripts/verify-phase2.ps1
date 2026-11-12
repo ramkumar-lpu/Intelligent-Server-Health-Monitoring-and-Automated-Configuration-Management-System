@@ -88,7 +88,7 @@ Write-Pass "Server certificate verified with required DNS SANs."
 
 # --- Test 5: Verify node-01 Certificate Authorization ---
 Write-Step "Verifying node-01 signed certificate status on Puppet Server..."
-if ($CaList -notmatch "node-01\.infra\.internal.*\(signed\)") {
+if ($CaList -notmatch "Signed Certificates:" -or $CaList -notmatch "node-01\.infra\.internal\s+\(SHA256\)") {
     Stop-OnFail "Certificate for 'node-01.infra.internal' is not signed by CA." "Sign the CSR using 'docker exec puppet-server puppetserver ca sign --certname node-01.infra.internal'."
 }
 Write-Pass "Agent certificate confirmed signed: node-01.infra.internal."

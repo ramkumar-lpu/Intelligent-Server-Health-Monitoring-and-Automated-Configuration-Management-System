@@ -1,0 +1,6 @@
+#!/bin/sh
+# Scheduled local backup staging readiness check for <%= $facts['networking']['fqdn'] %>
+set -eu
+BACKUP_DIR="/var/backups/infra/daily"
+mkdir -p "$BACKUP_DIR"
+date -u +"%Y-%m-%dT%H:%M:%SZ backup-staging-ok (<%= $facts['networking']['fqdn'] %>)" > "${BACKUP_DIR}/last_check.txt"

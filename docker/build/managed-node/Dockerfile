@@ -53,11 +53,13 @@ COPY configs/sshd_config /etc/ssh/sshd_config
 COPY configs/puppet.conf /etc/puppetlabs/puppet/puppet.conf
 COPY scripts/check_mem /usr/lib/nagios/plugins/check_mem
 COPY scripts/check_mem_cgroup /usr/lib/nagios/plugins/check_mem_cgroup
+COPY scripts/check_cpu_cgroup /usr/lib/nagios/plugins/check_cpu_cgroup
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 
 # Apply permissions
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/lib/nagios/plugins/check_mem && \
-    chmod 0755 /usr/lib/nagios/plugins/check_mem_cgroup && \
+    chmod 0755 /usr/lib/nagios/plugins/check_mem_cgroup /usr/lib/nagios/plugins/check_cpu_cgroup && \
+    chown root:root /usr/lib/nagios/plugins/check_mem_cgroup /usr/lib/nagios/plugins/check_cpu_cgroup && \
     chown -R nagios:nagios /etc/nagios/nrpe.cfg
 
 # Internal container ports (documentation only; ports remain unexposed on the host)

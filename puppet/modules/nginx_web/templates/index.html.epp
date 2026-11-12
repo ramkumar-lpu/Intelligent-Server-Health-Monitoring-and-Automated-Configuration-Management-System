@@ -1,0 +1,9 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title><%= $facts['networking']['fqdn'] %></title></head>
+<body>
+  <h1>Managed Web Node: <%= $facts['networking']['fqdn'] %></h1>
+  <p>IPv4: <%= $facts['networking']['ip'] %></p>
+  <p>Role: nginx-web (Puppet managed)</p>
+</body>
+</html>
