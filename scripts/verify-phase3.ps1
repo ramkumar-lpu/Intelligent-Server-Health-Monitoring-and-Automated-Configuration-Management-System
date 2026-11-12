@@ -80,6 +80,50 @@ Assert-Check "Nagios configuration pre-flight validation succeeds" {
     return ($val -match "Total Errors:\s+0")
 }
 
+# 8. Verify new CPU NRPE command on node-01 and Nagios command definition
+Assert-Check "NRPE check_cpu_cgroup and Nagios check_nrpe_cpu_cgroup commands are configured" {
+    $nrpeCmd = docker exec node-01 grep "command\[check_cpu_cgroup\]=" /etc/nagios/nrpe.cfg 2>&1 | Out-String
+    $nagiosCmd = docker exec nagios-server cat /opt/nagios/etc/objects/commands.cfg 2>&1 | Out-String
+    return (($nrpeCmd -match "command\[check_cpu_cgroup\]=/usr/lib/nagios/plugins/check_cpu_cgroup") -and ($nagiosCmd -match "command_name\s+check_nrpe_cpu_cgroup") -and ($nagiosCmd -match "-c\s+check_cpu_cgroup"))
+}
+
+# 9. Verify new CPU Nagios service on node-01
+Assert-Check "Nagios node-01 defines Container CPU - Cgroup service using check_nrpe_cpu_cgroup" {
+    $nodeCfg = docker exec nagios-server cat /opt/nagios/etc/conf.d/node-01.cfg 2>&1 | Out-String
+    return ($nodeCfg -match "service_description\s+Container CPU - Cgroup[\s\r\n]+check_command\s+check_nrpe_cpu_cgroup")
+}
+
+# 10. Verify renamed Host Load service on node-01
+Assert-Check "Nagios node-01 renames Current Load to Host Load - Shared Kernel" {
+    $nodeCfg = docker exec nagios-server cat /opt/nagios/etc/conf.d/node-01.cfg 2>&1 | Out-String
+    return (($nodeCfg -match "service_description\s+Host Load - Shared Kernel[\s\r\n]+check_command\s+check_nrpe!check_load") -and ($nodeCfg -notmatch "service_description\s+Current Load"))
+}
+
+# 11. Verify all eight node-01 monitoring services are configured
+Assert-Check "Nagios node-01 has all eight monitoring services configured" {
+    $nodeCfg = docker exec nagios-server cat /opt/nagios/etc/conf.d/node-01.cfg 2>&1 | Out-String
+    $expectedServices = @(
+        "PING",
+        "SSH",
+        "Host Load - Shared Kernel",
+        "Memory Usage",
+        "Root Partition",
+        "Current Users",
+        "Total Processes",
+        "Container CPU - Cgroup"
+    )
+    $serviceMatches = [regex]::Matches($nodeCfg, "define service\s*\{")
+    if ($serviceMatches.Count -ne 8) {
+        return $false
+    }
+    foreach ($svc in $expectedServices) {
+        if ($nodeCfg -notmatch ("service_description\s+" + [regex]::Escape($svc))) {
+            return $false
+        }
+    }
+    return $true
+}
+
 $summaryColor = "Green"
 if ($Failed -gt 0) { $summaryColor = "Red" }
 Write-Host "----------------------------------------------------------" -ForegroundColor Cyan
